@@ -1,0 +1,300 @@
+# -*- coding: utf-8 -*-
+"""
+.. codeauthor:: Mona Koehler <mona.koehler@tu-ilmenau.de>
+.. codeauthor:: Daniel Seichter <daniel.seichter@tu-ilmenau.de>
+"""
+from glob import glob
+import os
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import torch
+from tqdm import tqdm
+
+from nicr_mt_scene_analysis.data import move_batch_to_device
+from nicr_mt_scene_analysis.data import mt_collate
+
+from emsanet.args import ArgParserEMSANet
+from emsanet.data import get_datahelper
+from emsanet.model import EMSANet
+from emsanet.preprocessing import get_preprocessor
+from emsanet.visualization import visualize_predictions
+
+import matplotlib.patches as mpatches
+import matplotlib
+
+label_mapping = {1 : 'wall'               ,
+                 2 : 'floor'              ,
+                 3 : 'cabinet'            ,
+                 4 : 'bed'                ,
+                 5 : 'chair'              ,
+                 6 : 'sofa'               ,
+                 7 : 'table'              ,
+                 8 : 'door'               ,
+                 9 : 'window'             ,
+                 10 : 'bookshelf'         ,
+                 11 : 'picture'           ,
+                 12 : 'counter'           ,
+                 13 : 'blinds'            ,
+                 14 : 'desk'              ,
+                 15 : 'shelves'           ,
+                 16 : 'curtain'           ,
+                 17 : 'dresser'           ,
+                 18 : 'pillow'            ,
+                 19 : 'mirror'            ,
+                 20 : 'floor_mat'         ,
+                 21 : 'clothes'           ,
+                 22 : 'ceiling'           ,
+                 23 : 'books'             ,
+                 24 : 'fridge'            ,
+                 25 : 'tv'                ,
+                 26 : 'paper'             ,
+                 27 : 'towel'             ,
+                 28 : 'shower_curtain'    ,
+                 29 : 'box'               ,
+                 30 : 'whiteboard'        ,
+                 31 : 'person'            ,
+                 32 : 'night_stand'       ,
+                 33 : 'toilet'            ,
+                 34 : 'sink'              ,
+                 35 : 'lamp'              ,
+                 36 : 'bathtub'           ,
+                 37 : 'bag'
+                 }
+
+color_mapping = np.array((
+                        [0, 0, 255]        ,
+                        [245, 150, 100]    ,
+                        [245, 230, 100]    ,
+                        [250, 80, 100]     ,
+                        [150, 60, 30]      ,
+                        [255, 0, 0]        ,
+                        [180, 30, 80]      ,
+                        [255, 0, 0]        ,
+                        [30, 30, 255]      ,
+                        [200, 40, 255]     ,
+                        [90, 30, 150]      ,
+                        [255, 0, 255]      ,
+                        [255, 150, 255]    ,
+                        [75, 0, 75]        ,
+                        [75, 0, 175]       ,
+                        [0, 200, 255]      ,
+                        [50, 120, 255]     ,
+                        [0, 150, 255]      ,
+                        [170, 255, 150]    ,
+                        [0, 175, 0]        ,
+                        [0, 60, 135]       ,
+                        [80, 240, 150]     ,
+                        [150, 240, 255]    ,
+                        [0, 0, 255]        ,
+                        [255, 255, 50]     ,
+                        [245, 150, 100]    ,
+                        [255, 0, 0]        ,
+                        [200, 40, 255]     ,
+                        [30, 30, 255]      ,
+                        [90, 30, 150]      ,
+                        [250, 80, 100]     ,
+                        [180, 30, 80]      ,
+                        # added from SK
+                        [120, 30, 180]      ,
+                        [0, 200, 80]      ,
+                        [250, 120, 50]      ,
+                        [40, 120, 240]      ,
+                        # added from SK
+                        [255, 0, 0]))
+
+# labels = np.array([k for k,v in label_mapping.items()])
+
+def _get_args():
+    parser = ArgParserEMSANet()
+
+    # add additional arguments
+    parser.add_argument(
+        '--depth-max',
+        type=float,
+        default=None,
+        help="Additional max depth values. Values above are set to zero as "
+             "they are most likely not valid. Note, this clipping is applied "
+             "before scaling the depth values."
+    )
+    parser.add_argument(
+        '--depth-scale',
+        type=float,
+        default=1.0,
+        help="Additional depth scaling factor to apply."
+    )
+
+    args = parser.parse_args()
+
+    # this makes sure that visualization works
+    args.visualize_validation = True
+
+    return args
+
+
+def _load_img(fp):
+    img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
+
+
+def main():
+    args = _get_args()
+    assert all(x in args.input_modalities for x in ('rgb', 'depth')), \
+        "Only RGBD inference supported so far"
+
+    device = torch.device('cuda')
+
+    # data and model
+    data = get_datahelper(args)
+    dataset_config = data.dataset_config
+    model = EMSANet(args, dataset_config=dataset_config)
+
+    # load weights
+    checkpoint = torch.load(args.weights_filepath)
+    state_dict = checkpoint['state_dict']
+    model.load_state_dict(state_dict, strict=True)
+    print(f"Loading checkpoint: '{args.weights_filepath}'")
+
+    # torch.set_grad_enabled(False)
+    model.eval()
+    model.to(device)
+
+    # build preprocessor
+    preprocessor = get_preprocessor(
+        args,
+        dataset=data.datasets_valid[0],
+        phase='test',
+        multiscale_downscales=None
+    )
+
+    # get samples
+    basepath = 'samples/'
+    rgb_filepaths = sorted(glob(os.path.join(basepath, 'rgb/*')))
+    # depth_filepaths = sorted(glob(os.path.join(basepath, 'depth/*')))
+    # uncomment after unpacking
+    # assert len(rgb_filepaths) == len(depth_filepaths)
+
+
+
+    os.makedirs(basepath + '/seg', exist_ok=True)
+
+    scene_class_list = [data.dataset_config.scene_label_list[i].class_name for i in range(len(data.dataset_config.scene_label_list))]
+
+    for fp_rgb in tqdm(rgb_filepaths):
+        # load rgb and depth image
+        img_rgb = _load_img(fp_rgb)
+
+        # img_depth = _load_img(fp_depth).astype('float32')
+
+        # img_depth = (img_depth / img_depth.max() * 65535)
+        # DISABLE DEPTH FOR NOW
+        img_depth = np.zeros((480, 848))
+
+        if args.depth_max is not None:
+            img_depth[img_depth > args.depth_max] = 0
+
+        img_depth *= args.depth_scale
+
+        # preprocess sample
+        sample = preprocessor({
+            'rgb': img_rgb,
+            'depth': img_depth,
+            'identifier': os.path.basename(os.path.splitext(fp_rgb)[0]),
+                # 'semantic' : img_rgb
+        })
+
+
+
+        # add batch axis as there is no dataloader
+        batch = mt_collate([sample])
+        batch = move_batch_to_device(batch, device=device)
+
+        # apply model
+        prediction = model(batch, do_postprocessing=True)
+
+        # breakpoint()
+
+        # without depth
+        # label map in plot
+
+        # training of EMSANET
+
+
+
+        fullres_out_seg = prediction['semantic_segmentation_idx_fullres']
+        fullres_confidence = prediction['semantic_segmentation_score_fullres'][0].detach().cpu().numpy()
+
+
+
+
+        # take first to eliminate batch dimension
+        output_seg = fullres_out_seg[0].detach().cpu().numpy()
+
+        # print(img_rgb.shape, img_depth.shape, fullres_confidence.max())
+        # Plotting really slows down the inference
+        fig, ax = plt.subplots(1, 5, figsize=(12, 4), dpi=200)
+        # breakpoint()
+        ax[0].imshow(img_rgb, interpolation='none')
+        plt.title(scene_class_list[prediction['scene_class_idx']])
+
+        ax[1].imshow(color_mapping[output_seg], interpolation='none')
+        ax[2].imshow(img_rgb, interpolation='none')
+        ax[2].imshow(color_mapping[output_seg], 'jet', interpolation='none', alpha=.3)
+        ax[3].imshow(fullres_confidence, 'jet')
+        ax[4].imshow(color_mapping[output_seg * (fullres_confidence > 0.9)], 'jet')
+
+
+        colors = [matplotlib.colors.to_hex(i / 255) for seg_idx, i in enumerate(color_mapping) if seg_idx in output_seg]
+        #
+        texts = [v for k, v in label_mapping.items() if k - 1 in output_seg]  # shift by one
+
+        patches = [plt.plot([], [], marker="s", ms=6, ls="", mec=None, color=colors[i], label="{:s}".format(texts[i]))[0] for i in range(len(texts))]
+        plt.legend(handles=patches, bbox_to_anchor=(-1.8, -1.5), loc='lower center', ncol=10, numpoints=1)
+
+
+        plt.savefig(basepath + f'/seg/{os.path.basename(fp_rgb)}')
+        # breakpoint()
+        plt.close()
+
+        # # visualize predictions
+        # prediction_visualization = visualize_predictions(
+        #     prediction,
+        #     batch,
+        #     dataset_config
+        # )
+        #
+        # # show results
+        # fig, axs = plt.subplots(2, 4, figsize=(12, 6), dpi=150)
+        # [ax.set_axis_off() for ax in axs.ravel()]
+        # axs[0, 0].set_title('rgb')
+        # axs[0, 0].imshow(img_rgb)
+        # axs[0, 1].set_title('depth')
+        # axs[0, 1].imshow(img_depth)
+        # axs[0, 2].set_title('semantic')
+        # axs[0, 2].imshow(prediction_visualization['semantic'][0])
+        # axs[0, 3].set_title('panoptic')
+        # axs[0, 3].imshow(prediction_visualization['panoptic'][0])
+        # axs[1, 0].set_title('instance')
+        # axs[1, 0].imshow(prediction_visualization['instance'][0])
+        # axs[1, 1].set_title('instance center')
+        # axs[1, 1].imshow(prediction_visualization['instance_center'][0])
+        # axs[1, 2].set_title('instance offset')
+        # axs[1, 2].imshow(prediction_visualization['instance_offset'][0])
+        # axs[1, 3].set_title('panoptic with orientation')
+        # axs[1, 3].imshow(prediction_visualization['panoptic_orientation'][0])
+        #
+        # plt.suptitle(f"Image: ({os.path.basename(fp_rgb)}, "
+        #              f"{os.path.basename(fp_depth)}), "
+        #              f"Model: {args.weights_filepath}")
+        # plt.tight_layout()
+        #
+        # # fp = os.path.join('./', 'samples', f'result_{args.dataset}.png')
+        # # plt.savefig(fp, bbox_inches='tight', pad_inches=0.05, dpi=150)
+        #
+        # plt.show()
+
+
+if __name__ == '__main__':
+    main()
