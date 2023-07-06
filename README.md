@@ -21,3 +21,9 @@
 - Use the masks from High-performing Transformer to generate reliable masks, that inherit the segmentation
 - The output is the refined (improved on different viewpoints) segmentation as a pseudo label
 - Pseudo labels are used for training the online student model
+
+# TODO
+- [ ] training and inference scripts
+- [ ] fluent pipeline scripts with SAM
+- [ ] bash scripts for downloading the data, models
+- [ ] full sequence example on cor1 sequence
