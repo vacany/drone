@@ -27,6 +27,10 @@
 - Pseudo labels are used for training the online student model
 
 
+https://github.com/vacany/drone/assets/32822411/5587d11f-542f-4317-b261-38bdb48b7d20
+
+
+
 # TODO
 - [ ] Videos of segmentation and colored point clouds
 - [ ] training and inference scripts
